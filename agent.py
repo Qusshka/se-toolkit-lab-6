@@ -10,13 +10,24 @@ Output:
     All debug output goes to stderr.
 """
 
+# Force unbuffered output for stderr and stdout
+import io
+import sys
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
-import httpx
+# Check for required dependencies
+try:
+    import httpx
+except ImportError:
+    print("Error: httpx module not found. Run: uv sync", file=sys.stderr, flush=True)
+    sys.exit(1)
 
 # Maximum number of tool calls per question
 MAX_TOOL_CALLS = 15
@@ -635,7 +646,7 @@ def main() -> None:
     try:
         # Check command-line arguments
         if len(sys.argv) != 2:
-            print('Usage: uv run agent.py "Your question"', file=sys.stderr)
+            print('Usage: uv run agent.py "Your question"', file=sys.stderr, flush=True)
             sys.exit(1)
 
         question = sys.argv[1]
@@ -647,11 +658,13 @@ def main() -> None:
         output = run_agentic_loop(question, config)
 
         # Output JSON to stdout (single line)
-        print(json.dumps(output))
+        print(json.dumps(output), flush=True)
+    except SystemExit:
+        raise
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr, flush=True)
         import traceback
-        traceback.print_exc(file=sys.stderr)
+        traceback.print_exc(file=sys.stderr, flush=True)
         sys.exit(1)
 
 
