@@ -11,6 +11,13 @@ Output:
     All debug output goes to stderr.
 """
 
+# Early error handling - catch any import errors
+def _early_error(msg: str):
+    import sys
+    sys.stderr.write(f"AGENT ERROR: {msg}\n")
+    sys.stderr.flush()
+    sys.exit(1)
+
 # Force unbuffered output for stderr and stdout
 import io
 import sys
@@ -22,10 +29,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_bufferin
 try:
     import httpx
 except ImportError as e:
-    sys.stderr.write(f"Error: Missing dependency: {e}\n")
-    sys.stderr.write("Install with: pip install httpx\n")
-    sys.stderr.flush()
-    sys.exit(1)
+    _early_error(f"Missing dependency: {e}. Install with: pip install httpx")
 
 import json
 import os
@@ -395,7 +399,8 @@ Tool selection guide:
 When diagnosing bugs:
 - Look for operations that could fail with None values (sorted(), arithmetic, attribute access)
 - Identify the exact line and explain what type of error occurs (TypeError, ZeroDivisionError, etc.)
-- Mention the specific keywords: TypeError, None, NoneType, sorted, ZeroDivisionError, division by zero
+- Common bugs: ZeroDivisionError (division without checking for zero), TypeError (sorting/comparing None values)
+- For analytics endpoints: check for division by zero and None handling in sorted()
 
 IMPORTANT: Always include the source file path at the end of your answer in this exact format: "Source: wiki/filename.md" or "Source: path/to/file.ext"
 
@@ -482,13 +487,18 @@ def execute_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     """
     function = tool_call.get("function", {})
     tool_name: str = function.get("name", "unknown")
-    args_str = function.get("arguments", "{}")
+    args_raw = function.get("arguments")
 
-    # Parse arguments
-    try:
-        args: dict[str, Any] = json.loads(args_str)
-    except json.JSONDecodeError:
-        args = {}
+    # Parse arguments - handle both dict (Groq) and string (OpenAI) formats
+    args: dict[str, Any] = {}
+    if args_raw is not None:
+        if isinstance(args_raw, dict):
+            args = args_raw
+        elif isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw)
+            except json.JSONDecodeError:
+                args = {}
 
     print(f"Executing tool: {tool_name}({args})", file=sys.stderr)
 
@@ -558,7 +568,8 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict[str, Any]:
         if not tool_calls:
             # No tool calls - LLM provided final answer
             print("LLM provided final answer", file=sys.stderr)
-            answer = response.get("content", "")
+            # Handle both missing key and null value
+            answer = response.get("content") or ""
 
             # Try to extract source from the answer
             # Look for patterns like wiki/file.md or wiki/file.md#section
@@ -575,7 +586,7 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict[str, Any]:
             if not source_match:
                 # Try any .md file pattern
                 source_match = re.search(r"([a-zA-Z0-9_/.-]+\.md(?:#[\w-]+)?)", answer)
-            
+
             if source_match:
                 source = source_match.group(1)
                 print(f"Extracted source: {source}", file=sys.stderr)
