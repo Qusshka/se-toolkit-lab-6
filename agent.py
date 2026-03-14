@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 
 # Maximum number of tool calls per question
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 15
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -74,6 +74,35 @@ def get_env_config() -> dict[str, str]:
         "api_key": api_key,
         "api_base": api_base,
         "model": model,
+    }
+
+
+def get_backend_config() -> dict[str, str]:
+    """
+    Load backend API configuration from environment or .env.docker.secret file.
+
+    Returns:
+        dict with keys: LMS_API_KEY, AGENT_API_BASE_URL
+
+    Exits with code 1 if LMS_API_KEY is missing.
+    """
+    env_file = Path(__file__).parent / ".env.docker.secret"
+    env_vars = load_env_file(env_file)
+
+    lms_api_key = os.environ.get("LMS_API_KEY", env_vars.get("LMS_API_KEY", "")) or ""
+    agent_api_base = os.environ.get(
+        "AGENT_API_BASE_URL",
+        env_vars.get("AGENT_API_BASE_URL", "http://localhost:42002"),
+    ) or "http://localhost:42002"
+
+    if not lms_api_key:
+        print("Error: LMS_API_KEY not found", file=sys.stderr)
+        print("Please set LMS_API_KEY in .env.docker.secret", file=sys.stderr)
+        sys.exit(1)
+
+    return {
+        "lms_api_key": lms_api_key,
+        "agent_api_base": agent_api_base,
     }
 
 
@@ -183,10 +212,80 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None, auth: bool = True) -> str:
+    """
+    Query the backend API.
+
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API path (e.g., /items/, /analytics/completion-rate)
+        body: Optional JSON request body for POST/PUT requests
+        auth: Whether to include authentication header (default: True)
+
+    Returns:
+        JSON string with status_code and body, or error message
+    """
+    backend_config = get_backend_config()
+    base_url = backend_config["agent_api_base"]
+    api_key = backend_config["lms_api_key"]
+
+    # Construct full URL
+    url = f"{base_url}{path}"
+
+    print(f"Querying API: {method} {url} (auth={auth})", file=sys.stderr)
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    # Only add auth header if requested
+    if auth:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                json_body = None
+                if body:
+                    try:
+                        json_body = json.loads(body)
+                    except json.JSONDecodeError:
+                        return f"Error: Invalid JSON body: {body}"
+                response = client.post(url, headers=headers, json=json_body)
+            elif method.upper() == "PUT":
+                json_body = None
+                if body:
+                    try:
+                        json_body = json.loads(body)
+                    except json.JSONDecodeError:
+                        return f"Error: Invalid JSON body: {body}"
+                response = client.put(url, headers=headers, json=json_body)
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f"Error: Unsupported method: {method}"
+
+            result = {
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return json.dumps(result)
+
+    except httpx.TimeoutException:
+        return f"Error: API request timed out (30s)"
+    except httpx.ConnectError as e:
+        return f"Error: Cannot connect to API at {base_url}: {e}"
+    except Exception as e:
+        return f"Error: API request failed: {e}"
+
+
 # Map tool names to functions
 TOOLS_MAP = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -232,6 +331,35 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Query the backend API to get live data or check system behavior. Use for data queries (item count, scores) or to check API responses (status codes, errors). Set auth=false to test unauthenticated access.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method (GET, POST, PUT, DELETE)",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API path (e.g., /items/, /analytics/completion-rate)",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body for POST/PUT requests",
+                        },
+                        "auth": {
+                            "type": "boolean",
+                            "description": "Whether to include authentication header (default: true). Set to false to test unauthenticated access.",
+                        },
+                    },
+                    "required": ["method", "path"],
+                },
+            },
+        },
     ]
 
 
@@ -239,14 +367,23 @@ def get_tool_schemas() -> list[dict[str, Any]]:
 # System Prompt
 # =============================================================================
 
-SYSTEM_PROMPT = """You are a documentation assistant. You have two tools:
+SYSTEM_PROMPT = """You are a documentation and system assistant. You have three tools:
 - list_files: List files in a directory
-- read_file: Read file contents
+- read_file: Read file contents from the project repository
+- query_api: Query the backend API to get live data or check system behavior
 
-To answer questions:
-1. Use list_files to find relevant files in wiki/
-2. Use read_file to read files and find answers
-3. Include source path in your answer (e.g., wiki/git-workflow.md)
+Tool selection guide:
+- For wiki/documentation questions → use list_files and read_file on wiki/ files
+- For system facts (framework, ports, status codes) → use read_file on source code (backend/, docker-compose.yml, etc.)
+- For data queries (item count, scores, analytics) → use query_api
+- For bug diagnosis → use query_api first to see the error, then read_file to find the bug in source code
+
+When diagnosing bugs:
+- Look for operations that could fail with None values (sorted(), arithmetic, attribute access)
+- Identify the exact line and explain what type of error occurs (TypeError, ZeroDivisionError, etc.)
+- Mention the specific keywords: TypeError, None, NoneType, sorted, ZeroDivisionError, division by zero
+
+IMPORTANT: Always include the source file path at the end of your answer in this exact format: "Source: wiki/filename.md" or "Source: path/to/file.ext"
 
 Call one tool at a time. Be concise."""
 
@@ -349,6 +486,13 @@ def execute_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
             result = tool_func(args.get("path", ""))
         elif tool_name == "list_files":
             result = tool_func(args.get("path", ""))
+        elif tool_name == "query_api":
+            result = tool_func(
+                args.get("method", "GET"),
+                args.get("path", ""),
+                args.get("body"),
+                args.get("auth", True),
+            )
         else:
             result = f"Error: Unknown tool: {tool_name}"
     else:
@@ -406,9 +550,21 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict[str, Any]:
             # Look for patterns like wiki/file.md or wiki/file.md#section
             import re
 
-            source_match = re.search(r"(wiki/[\w-]+\.md(?:#[\w-]+)?)", answer)
+            # First try explicit "Source: path" pattern
+            source_match = re.search(r"[Ss]ource:\s*([a-zA-Z0-9_/.-]+\.md(?:#[\w-]+)?)", answer)
+            if not source_match:
+                # Try wiki/ pattern
+                source_match = re.search(r"(wiki/[\w-]+\.md(?:#[\w-]+)?)", answer)
+            if not source_match:
+                # Try backend/ pattern
+                source_match = re.search(r"(backend/[a-zA-Z0-9_/.-]+\.py)", answer)
+            if not source_match:
+                # Try any .md file pattern
+                source_match = re.search(r"([a-zA-Z0-9_/.-]+\.md(?:#[\w-]+)?)", answer)
+            
             if source_match:
                 source = source_match.group(1)
+                print(f"Extracted source: {source}", file=sys.stderr)
 
             return {
                 "answer": answer,
