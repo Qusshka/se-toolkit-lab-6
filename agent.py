@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Agent CLI - Calls an LLM to answer questions.
+Agent CLI - Calls an LLM with tools to answer questions using project documentation.
 
 Usage:
     uv run agent.py "Your question here"
 
 Output:
-    JSON to stdout: {"answer": "...", "tool_calls": []}
+    JSON to stdout: {"answer": "...", "source": "...", "tool_calls": [...]}
     All debug output goes to stderr.
 """
 
@@ -14,8 +14,12 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import httpx
+
+# Maximum number of tool calls per question
+MAX_TOOL_CALLS = 10
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -73,16 +77,200 @@ def get_env_config() -> dict[str, str]:
     }
 
 
-def call_lllm(question: str, config: dict[str, str]) -> str:
-    """
-    Call the LLM API and get an answer.
+# =============================================================================
+# Tool Definitions
+# =============================================================================
 
-    Args:
-        question: The user's question
-        config: Configuration dict with api_key, api_base, model
+
+def get_project_root() -> Path:
+    """Get the project root directory (where agent.py is located)."""
+    return Path(__file__).parent
+
+
+def is_safe_path(path_str: str) -> tuple[bool, str]:
+    """
+    Check if a path is safe to access (within project root).
 
     Returns:
-        The LLM's answer as a string
+        Tuple of (is_safe, error_message)
+    """
+    # Reject absolute paths
+    if os.path.isabs(path_str):
+        return False, f"Absolute paths not allowed: {path_str}"
+
+    # Reject path traversal
+    if ".." in path_str:
+        return False, f"Path traversal not allowed: {path_str}"
+
+    # Resolve the full path
+    project_root = get_project_root()
+    try:
+        full_path = (project_root / path_str).resolve()
+        # Ensure the resolved path is within project root
+        if not str(full_path).startswith(str(project_root.resolve())):
+            return False, f"Path outside project root: {path_str}"
+    except Exception as e:
+        return False, f"Invalid path: {e}"
+
+    return True, ""
+
+
+def read_file(path: str) -> str:
+    """
+    Read the contents of a file.
+
+    Args:
+        path: Relative path from project root
+
+    Returns:
+        File contents as string, or error message
+    """
+    # Security check
+    is_safe, error = is_safe_path(path)
+    if not is_safe:
+        return f"Error: {error}"
+
+    project_root = get_project_root()
+    file_path = project_root / path
+
+    if not file_path.exists():
+        return f"Error: File not found: {path}"
+
+    if not file_path.is_file():
+        return f"Error: Not a file: {path}"
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+def list_files(path: str) -> str:
+    """
+    List files and directories at a given path.
+
+    Args:
+        path: Relative directory path from project root
+
+    Returns:
+        Newline-separated listing of entries, or error message
+    """
+    # Security check
+    is_safe, error = is_safe_path(path)
+    if not is_safe:
+        return f"Error: {error}"
+
+    project_root = get_project_root()
+    dir_path = project_root / path
+
+    if not dir_path.exists():
+        return f"Error: Directory not found: {path}"
+
+    if not dir_path.is_dir():
+        return f"Error: Not a directory: {path}"
+
+    try:
+        entries = sorted(dir_path.iterdir())
+        # Filter out hidden files and __pycache__
+        visible_entries = [
+            e.name
+            for e in entries
+            if not e.name.startswith(".") and e.name != "__pycache__"
+        ]
+        return "\n".join(visible_entries)
+    except Exception as e:
+        return f"Error listing directory: {e}"
+
+
+# Map tool names to functions
+TOOLS_MAP = {
+    "read_file": read_file,
+    "list_files": list_files,
+}
+
+
+def get_tool_schemas() -> list[dict[str, Any]]:
+    """
+    Get OpenAI-compatible function calling schemas for all tools.
+
+    Returns:
+        List of tool schemas
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file from the project repository",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')",
+                        }
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files and directories at a given path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory path from project root (e.g., 'wiki')",
+                        }
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+    ]
+
+
+# =============================================================================
+# System Prompt
+# =============================================================================
+
+SYSTEM_PROMPT = """You are a documentation assistant. You have two tools:
+- list_files: List files in a directory
+- read_file: Read file contents
+
+To answer questions:
+1. Use list_files to find relevant files in wiki/
+2. Use read_file to read files and find answers
+3. Include source path in your answer (e.g., wiki/git-workflow.md)
+
+Call one tool at a time. Be concise."""
+
+
+# =============================================================================
+# LLM Communication
+# =============================================================================
+
+
+def call_llm_with_tools(
+    messages: list[dict[str, Any]],
+    config: dict[str, str],
+    tool_schemas: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Call the LLM API with tool definitions.
+
+    Args:
+        messages: List of message dicts (role, content, etc.)
+        config: Configuration dict with api_key, api_base, model
+        tool_schemas: List of tool schemas
+
+    Returns:
+        Parsed response from LLM
 
     Raises:
         SystemExit: If the API request fails
@@ -94,33 +282,26 @@ def call_lllm(question: str, config: dict[str, str]) -> str:
     }
     payload = {
         "model": config["model"],
-        "messages": [{"role": "user", "content": question}],
+        "messages": messages,
+        "tools": tool_schemas,
+        "tool_choice": "auto",
     }
 
     print(f"Calling LLM at {url}...", file=sys.stderr)
 
     try:
-        # Use timeout of 60 seconds as per requirements
         with httpx.Client(timeout=60.0) as client:
             response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
 
-            # Extract answer from response
-            # OpenAI-compatible format: choices[0].message.content
             choices = data.get("choices", [])
             if not choices:
                 print("Error: No choices in LLM response", file=sys.stderr)
                 print(f"Response: {data}", file=sys.stderr)
                 sys.exit(1)
 
-            answer = choices[0].get("message", {}).get("content", "")
-            if not answer:
-                print("Error: Empty answer from LLM", file=sys.stderr)
-                print(f"Response: {data}", file=sys.stderr)
-                sys.exit(1)
-
-            return answer
+            return choices[0]["message"]
 
     except httpx.TimeoutException:
         print("Error: LLM request timed out (60s)", file=sys.stderr)
@@ -131,6 +312,166 @@ def call_lllm(question: str, config: dict[str, str]) -> str:
     except Exception as e:
         print(f"Error: Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+# =============================================================================
+# Agentic Loop
+# =============================================================================
+
+
+def execute_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+    """
+    Execute a single tool call.
+
+    Args:
+        tool_call: Tool call dict from LLM response
+
+    Returns:
+        Tool call record with tool, args, and result
+    """
+    function = tool_call.get("function", {})
+    tool_name: str = function.get("name", "unknown")
+    args_str = function.get("arguments", "{}")
+
+    # Parse arguments
+    try:
+        args: dict[str, Any] = json.loads(args_str)
+    except json.JSONDecodeError:
+        args = {}
+
+    print(f"Executing tool: {tool_name}({args})", file=sys.stderr)
+
+    # Execute the tool
+    if tool_name in TOOLS_MAP:
+        tool_func = TOOLS_MAP[tool_name]
+        # Call based on tool name to ensure type safety
+        if tool_name == "read_file":
+            result = tool_func(args.get("path", ""))
+        elif tool_name == "list_files":
+            result = tool_func(args.get("path", ""))
+        else:
+            result = f"Error: Unknown tool: {tool_name}"
+    else:
+        result = f"Error: Unknown tool: {tool_name}"
+
+    print(
+        f"Tool result: {result[:200]}..."
+        if len(result) > 200
+        else f"Tool result: {result}",
+        file=sys.stderr,
+    )
+
+    return {
+        "tool": tool_name,
+        "args": args,
+        "result": result,
+    }
+
+
+def run_agentic_loop(question: str, config: dict[str, str]) -> dict[str, Any]:
+    """
+    Run the agentic loop: LLM → tool calls → execute → repeat until answer.
+
+    Args:
+        question: User's question
+        config: Configuration dict
+
+    Returns:
+        Output dict with answer, source, and tool_calls
+    """
+    tool_schemas = get_tool_schemas()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+
+    all_tool_calls: list[dict[str, Any]] = []
+    source = ""
+
+    for iteration in range(MAX_TOOL_CALLS):
+        print(f"\n--- Iteration {iteration + 1}/{MAX_TOOL_CALLS} ---", file=sys.stderr)
+
+        # Call LLM
+        response = call_llm_with_tools(messages, config, tool_schemas)
+
+        # Check for tool calls
+        tool_calls = response.get("tool_calls", [])
+
+        if not tool_calls:
+            # No tool calls - LLM provided final answer
+            print("LLM provided final answer", file=sys.stderr)
+            answer = response.get("content", "")
+
+            # Try to extract source from the answer
+            # Look for patterns like wiki/file.md or wiki/file.md#section
+            import re
+
+            source_match = re.search(r"(wiki/[\w-]+\.md(?:#[\w-]+)?)", answer)
+            if source_match:
+                source = source_match.group(1)
+
+            return {
+                "answer": answer,
+                "source": source,
+                "tool_calls": all_tool_calls,
+            }
+
+        # Execute tool calls
+        for tool_call in tool_calls:
+            tool_result = execute_tool_call(tool_call)
+            all_tool_calls.append(tool_result)
+
+            # Append tool response to messages
+            # First add the assistant message with tool_calls, then the tool response
+            tool_call_id = tool_call.get("id") or f"call_{len(all_tool_calls)}"
+
+            # Add assistant message with tool_call
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [tool_call],
+                }
+            )
+
+            # Add tool response
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_result["result"],
+                }
+            )
+
+    # Max iterations reached
+    print("Max tool calls reached", file=sys.stderr)
+
+    # Try to get an answer from the LLM with the collected context
+    messages.append(
+        {
+            "role": "system",
+            "content": "You've reached the maximum number of tool calls. Provide a final answer based on the information you've gathered, including the source file path.",
+        }
+    )
+
+    response = call_llm_with_tools(messages, config, tool_schemas)
+    answer = response.get("content", "")
+
+    import re
+
+    source_match = re.search(r"(wiki/[\w-]+\.md(?:#[\w-]+)?)", answer)
+    if source_match:
+        source = source_match.group(1)
+
+    return {
+        "answer": answer,
+        "source": source,
+        "tool_calls": all_tool_calls,
+    }
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 
 def main() -> None:
@@ -145,14 +486,8 @@ def main() -> None:
     # Load configuration
     config = get_env_config()
 
-    # Call LLM and get answer
-    answer = call_lllm(question, config)
-
-    # Build output structure
-    output: dict[str, str | list[object]] = {
-        "answer": answer,
-        "tool_calls": [],
-    }
+    # Run agentic loop
+    output = run_agentic_loop(question, config)
 
     # Output JSON to stdout (single line)
     print(json.dumps(output))

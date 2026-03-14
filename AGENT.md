@@ -2,15 +2,23 @@
 
 ## Overview
 
-This project implements an AI agent that answers questions by calling an LLM (Large Language Model). The agent is built as a CLI tool that takes a question as input and returns a structured JSON response.
+This project implements an AI documentation agent that answers questions by calling an LLM (Large Language Model) with **tools**. The agent can read project files and list directories to find accurate information from the project documentation.
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  CLI Argument   │────▶│   agent.py   │────▶│  LLM API     │────▶│  JSON Output │
-│  (question)     │     │              │     │  (Qwen)      │     │  (stdout)    │
-└─────────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+│  (question)     │     │  (Agentic    │     │  (Qwen)      │     │  (stdout)    │
+│                 │     │   Loop)      │     │              │     │              │
+└─────────────────┘     └──────┬───────┘     └──────────────┘     └──────────────┘
+                               │
+                               ▼
+                        ┌──────────────┐
+                        │ Tools:       │
+                        │ - read_file  │
+                        │ - list_files │
+                        └──────────────┘
                                │
                                ▼
                         ┌──────────────┐
@@ -26,17 +34,27 @@ This project implements an AI agent that answers questions by calling an LLM (La
 The main entry point is a Python CLI script that:
 - Accepts a single command-line argument (the question)
 - Loads configuration from `.env.agent.secret`
-- Calls the LLM API
-- Outputs a JSON response to stdout
+- Runs an **agentic loop** with tool support
+- Outputs a structured JSON response to stdout
 
 **Usage:**
 ```bash
-uv run agent.py "What does REST stand for?"
+uv run agent.py "What files are in the wiki?"
 ```
 
 **Output:**
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{
+  "answer": "The wiki directory contains...",
+  "source": "wiki/git-workflow.md",
+  "tool_calls": [
+    {
+      "tool": "list_files",
+      "args": {"path": "wiki"},
+      "result": "file1.md\nfile2.md\n..."
+    }
+  ]
+}
 ```
 
 ### 2. Configuration (`.env.agent.secret`)
@@ -58,55 +76,114 @@ The agent reads the following environment variables from `.env.agent.secret`:
 **Why Qwen Code?**
 - 1000 free requests per day
 - Works from Russia
-- OpenAI-compatible API
-- Strong tool calling capabilities (for future tasks)
+- OpenAI-compatible API with tool calling support
+- Strong reasoning capabilities
 
 **Model:** `qwen3-coder-plus`
 
-### 4. HTTP Client
+### 4. Tools
 
-The agent uses `httpx` (synchronous client) to make HTTP POST requests to the LLM API.
+The agent has two tools that the LLM can call:
 
-**Request format:**
+#### `read_file`
+
+Reads the contents of a file from the project repository.
+
+**Parameters:**
+- `path` (string, required): Relative path from project root
+
+**Returns:** File contents as string, or error message
+
+**Security:**
+- Rejects absolute paths
+- Rejects paths containing `../` (path traversal prevention)
+- Only allows files within project root
+
+#### `list_files`
+
+Lists files and directories at a given path.
+
+**Parameters:**
+- `path` (string, required): Relative directory path from project root
+
+**Returns:** Newline-separated listing of entries, or error message
+
+**Security:**
+- Same path validation as `read_file`
+- Filters out hidden files (starting with `.`) and `__pycache__`
+
+### 5. Agentic Loop
+
+The agent implements an iterative loop:
+
 ```
-POST {LLM_API_BASE}/chat/completions
-Authorization: Bearer {LLM_API_KEY}
-Content-Type: application/json
-
-{
-  "model": "qwen3-coder-plus",
-  "messages": [
-    {"role": "user", "content": "Your question here"}
-  ]
-}
+1. Send question + system prompt to LLM (with tool definitions)
+2. LLM responds with either:
+   a. tool_calls → Execute tools, append results, go to step 1
+   b. Final answer → Extract answer and source, output JSON, exit
+3. Maximum 10 iterations (prevents infinite loops)
 ```
 
-**Response format (OpenAI-compatible):**
-```json
-{
-  "choices": [
-    {
-      "message": {
-        "content": "The answer from the LLM"
-      }
-    }
-  ]
-}
+**Message Format:**
+```python
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": question},
+    # If tools are called:
+    {"role": "assistant", "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "...", "content": "result"},
+    # Loop continues...
+]
 ```
 
-### 5. Output Structure
+### 6. System Prompt
+
+The system prompt instructs the LLM to:
+- Use `list_files` to discover relevant files in `wiki/`
+- Use `read_file` to read specific files and find answers
+- Include source file paths in the final answer
+- Call one tool at a time and wait for results
+
+**Example:**
+```
+You are a documentation assistant. You have two tools:
+- list_files: List files in a directory
+- read_file: Read file contents
+
+To answer questions:
+1. Use list_files to find relevant files in wiki/
+2. Use read_file to read files and find answers
+3. Include source path in your answer (e.g., wiki/git-workflow.md)
+
+Call one tool at a time. Be concise.
+```
+
+### 7. Output Structure
 
 The agent outputs a single JSON line to stdout:
 
 ```json
 {
-  "answer": "The LLM's response text",
-  "tool_calls": []
+  "answer": "The answer from the LLM",
+  "source": "wiki/git-workflow.md#section",
+  "tool_calls": [
+    {
+      "tool": "list_files",
+      "args": {"path": "wiki"},
+      "result": "file1.md\nfile2.md"
+    },
+    {
+      "tool": "read_file",
+      "args": {"path": "wiki/git-workflow.md"},
+      "result": "File contents..."
+    }
+  ]
 }
 ```
 
-- `answer`: The text response from the LLM (required)
-- `tool_calls`: Empty array for Task 1 (will be populated in Task 2 when tools are added)
+- `answer` (string, required): The LLM's text response
+- `source` (string, required): Reference to the wiki file (e.g., `wiki/git-workflow.md`)
+- `tool_calls` (array, required): List of all tool calls made during the loop
 
 **Important:** All debug/progress output goes to stderr, only the JSON result goes to stdout.
 
@@ -118,6 +195,9 @@ The agent outputs a single JSON line to stdout:
 | API timeout (>60s) | Print error to stderr, exit code 1 |
 | API connection error | Print error to stderr, exit code 1 |
 | Invalid API response | Print error to stderr, exit code 1 |
+| Path traversal attempt | Return error as tool result (no crash) |
+| File not found | Return error as tool result |
+| Max iterations (10) | Stop loop, return partial answer |
 | Success | Output JSON to stdout, exit code 0 |
 
 ## Running the Agent
@@ -131,42 +211,56 @@ The agent outputs a single JSON line to stdout:
 ### Test the Agent
 
 ```bash
-# Test with a simple question
-uv run agent.py "What is 2 + 2?"
+# List wiki files
+uv run agent.py "What files are in the wiki?"
 
-# Expected output:
-# {"answer": "2 + 2 = 4.", "tool_calls": []}
+# Ask about merge conflicts
+uv run agent.py "How do you resolve a merge conflict?"
+
+# Ask about git workflow
+uv run agent.py "How do I create a pull request?"
 ```
 
 ## Testing
 
-Run the regression test:
+Run the regression tests:
 
 ```bash
-# Run unit tests
-uv run poe test-unit
+# Run Task 2 tests
+uv run pytest test_agent_task2.py -v
+
+# Run all tests
+uv run pytest test_agent_task1.py test_agent_task2.py -v
 ```
 
-The test verifies that:
-- The agent outputs valid JSON
-- The `answer` field is present and non-empty
-- The `tool_calls` field is present and is an empty list
-
-## Future Extensions (Tasks 2-3)
-
-- **Task 2:** Add tool support (file operations, API queries)
-- **Task 3:** Add agentic loop (plan → act → observe → repeat)
+Tests verify:
+- Agent outputs valid JSON
+- `read_file` tool is used for documentation questions
+- `list_files` tool is used for directory listing questions
+- Tool calls include `tool`, `args`, and `result` fields
 
 ## File Structure
 
 ```
 project-root/
-├── agent.py              # Main CLI agent
+├── agent.py              # Main CLI agent with agentic loop
 ├── AGENT.md              # This documentation
 ├── .env.agent.secret     # LLM configuration (gitignored)
 ├── .env.agent.example    # Example configuration
 ├── plans/
-│   └── task-1.md         # Implementation plan
-└── backend/tests/unit/
-    └── test_agent_task1.py  # Regression test
+│   ├── task-1.md         # Task 1 implementation plan
+│   └── task-2.md         # Task 2 implementation plan
+├── test_agent_task1.py   # Task 1 regression test
+├── test_agent_task2.py   # Task 2 regression tests
+└── wiki/                 # Project documentation (agent reads from here)
+    ├── git-workflow.md
+    ├── git.md
+    └── ...
 ```
+
+## Future Extensions (Task 3)
+
+- **Task 3:** Add more tools (API queries, code execution)
+- Enhanced source extraction with section anchors
+- Improved error recovery and retry logic
+- Caching for frequently accessed files
