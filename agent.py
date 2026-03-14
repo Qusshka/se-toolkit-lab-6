@@ -4,6 +4,7 @@ Agent CLI - Calls an LLM with tools to answer questions using project documentat
 
 Usage:
     uv run agent.py "Your question here"
+    python agent.py "Your question here"  (if dependencies are installed)
 
 Output:
     JSON to stdout: {"answer": "...", "source": "...", "tool_calls": [...]}
@@ -17,17 +18,19 @@ import sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
 
+# Early dependency check - before any other imports
+try:
+    import httpx
+except ImportError as e:
+    sys.stderr.write(f"Error: Missing dependency: {e}\n")
+    sys.stderr.write("Install with: pip install httpx\n")
+    sys.stderr.flush()
+    sys.exit(1)
+
 import json
 import os
 from pathlib import Path
 from typing import Any
-
-# Check for required dependencies
-try:
-    import httpx
-except ImportError:
-    print("Error: httpx module not found. Run: uv sync", file=sys.stderr, flush=True)
-    sys.exit(1)
 
 # Maximum number of tool calls per question
 MAX_TOOL_CALLS = 15
