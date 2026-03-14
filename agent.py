@@ -632,21 +632,27 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict[str, Any]:
 
 def main() -> None:
     """Main entry point for the agent CLI."""
-    # Check command-line arguments
-    if len(sys.argv) != 2:
-        print('Usage: uv run agent.py "Your question"', file=sys.stderr)
+    try:
+        # Check command-line arguments
+        if len(sys.argv) != 2:
+            print('Usage: uv run agent.py "Your question"', file=sys.stderr)
+            sys.exit(1)
+
+        question = sys.argv[1]
+
+        # Load configuration
+        config = get_env_config()
+
+        # Run agentic loop
+        output = run_agentic_loop(question, config)
+
+        # Output JSON to stdout (single line)
+        print(json.dumps(output))
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
-    question = sys.argv[1]
-
-    # Load configuration
-    config = get_env_config()
-
-    # Run agentic loop
-    output = run_agentic_loop(question, config)
-
-    # Output JSON to stdout (single line)
-    print(json.dumps(output))
 
 
 if __name__ == "__main__":
